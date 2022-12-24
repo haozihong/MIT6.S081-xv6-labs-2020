@@ -15,36 +15,61 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+// Returns a kernel page table
+pagetable_t
+kvmcreate(void)
+{
+  pagetable_t pagetable = (pagetable_t) kalloc();
+  if(pagetable == 0)
+    return 0;
+  memset(pagetable, 0, PGSIZE);
+
+  // uart registers
+  if(mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0)
+    panic("kvmcreate");
+
+  // virtio mmio disk interface
+  if(mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
+    panic("kvmcreate");
+
+  // CLINT
+  if(mappages(pagetable, CLINT, 0x10000, CLINT, PTE_R | PTE_W) != 0)
+    panic("kvmcreate");
+
+  // PLIC
+  if(mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0)
+    panic("kvmcreate");
+
+  // map kernel text executable and read-only.
+  if(mappages(
+      pagetable, KERNBASE, (uint64)etext-KERNBASE, KERNBASE, PTE_R | PTE_X
+    ) != 0)
+    panic("kvmcreate");
+
+  // map kernel data and the physical RAM we'll make use of.
+  if(mappages(
+      pagetable, (uint64)etext, PHYSTOP-(uint64)etext, 
+      (uint64)etext, PTE_R | PTE_W
+    ) != 0)
+    panic("kvmcreate");
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  if(mappages(
+      pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X
+    ) != 0)
+    panic("kvmcreate");
+
+  return pagetable;
+}
+
 /*
  * create a direct-map page table for the kernel.
  */
 void
 kvminit()
 {
-  kernel_pagetable = (pagetable_t) kalloc();
-  memset(kernel_pagetable, 0, PGSIZE);
-
-  // uart registers
-  kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
-
-  // virtio mmio disk interface
-  kvmmap(VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-
-  // CLINT
-  kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
-
-  // PLIC
-  kvmmap(PLIC, PLIC, 0x400000, PTE_R | PTE_W);
-
-  // map kernel text executable and read-only.
-  kvmmap(KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
-
-  // map kernel data and the physical RAM we'll make use of.
-  kvmmap((uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
-
-  // map the trampoline for trap entry/exit to
-  // the highest virtual address in the kernel.
-  kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  kernel_pagetable = kvmcreate();
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -119,6 +144,12 @@ kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
 {
   if(mappages(kernel_pagetable, va, sz, pa, perm) != 0)
     panic("kvmmap");
+}
+
+void
+kvmunmap(uint64 va, uint64 npages, int do_free)
+{
+  uvmunmap(kernel_pagetable, va, npages, do_free);
 }
 
 // translate a kernel virtual address to
@@ -270,9 +301,10 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 }
 
 // Recursively free page-table pages.
-// All leaf mappings must already have been removed.
+// All leaf mappings must already have been removed
+// if check_leaf != 0.
 void
-freewalk(pagetable_t pagetable)
+freewalk(pagetable_t pagetable, int check_leaf)
 {
   // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
@@ -280,13 +312,21 @@ freewalk(pagetable_t pagetable)
     if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
-      freewalk((pagetable_t)child);
+      freewalk((pagetable_t)child, check_leaf);
       pagetable[i] = 0;
-    } else if(pte & PTE_V){
+    } else if(check_leaf && pte & PTE_V){
       panic("freewalk: leaf");
     }
   }
   kfree((void*)pagetable);
+}
+
+// Free process' page-table pages without
+// freeing the leaf physical memory pages. 
+void
+kvmfree(pagetable_t pagetable)
+{
+  freewalk(pagetable, 0);
 }
 
 // Free user memory pages,
@@ -296,7 +336,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
-  freewalk(pagetable);
+  freewalk(pagetable, 1);
 }
 
 // Given a parent process's page table, copy
