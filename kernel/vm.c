@@ -172,12 +172,8 @@ kvmpa(uint64 va)
   return pa+off;
 }
 
-// Create PTEs for virtual addresses starting at va that refer to
-// physical addresses starting at pa. va and size might not
-// be page-aligned. Returns 0 on success, -1 if walk() couldn't
-// allocate a needed page-table page.
 int
-mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+mappages2(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm, int allow_remap)
 {
   uint64 a, last;
   pte_t *pte;
@@ -187,7 +183,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_V)
+    if(!allow_remap && *pte & PTE_V)
       panic("remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
@@ -196,6 +192,16 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
     pa += PGSIZE;
   }
   return 0;
+}
+
+// Create PTEs for virtual addresses starting at va that refer to
+// physical addresses starting at pa. va and size might not
+// be page-aligned. Returns 0 on success, -1 if walk() couldn't
+// allocate a needed page-table page.
+int
+mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  return mappages2(pagetable, va, size, pa, perm, 0);
 }
 
 // Remove npages of mappings starting from va. va must be
@@ -419,23 +425,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -445,40 +435,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  return copyinstr_new(pagetable, dst, srcva, max);
 }
 
 void
@@ -505,4 +462,31 @@ vmprint(pagetable_t pagetable)
 {
   printf("page table %p\n", pagetable);
   vmprintwalk(pagetable, 0);
+}
+
+// Match dst kernel pagetable's [firstva, lastva) mapping with src pagetable. 
+// If fistva > lastva, unmap the pages. 
+int
+matchkpt(pagetable_t dst, pagetable_t src, uint64 firstva, uint64 lastva)
+{
+  pte_t *pte;
+  uint64 va, pa;
+  uint flags;
+
+  if(firstva < lastva){
+    for (va = PGROUNDDOWN(firstva); va < lastva; va += PGSIZE){
+      if((pte = walk(src, va, 0)) == 0)
+        panic("match_pagetable: pte should exist");
+      if((*pte & PTE_V) == 0)
+        panic("match_pagetable: page not present");
+      pa = PTE2PA(*pte);
+      flags = PTE_FLAGS(*pte) & (~PTE_U);
+      if(mappages2(dst, va, PGSIZE, pa, flags, 1) != 0)
+        return -1;
+    }
+  } else if(PGROUNDUP(lastva) < PGROUNDUP(firstva)){
+    int npages = (PGROUNDUP(firstva) - PGROUNDUP(lastva)) / PGSIZE;
+    uvmunmap(dst, PGROUNDUP(lastva), npages, 0);
+  }
+  return 0;
 }
