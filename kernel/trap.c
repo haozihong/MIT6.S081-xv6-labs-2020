@@ -76,6 +76,18 @@ usertrap(void)
   if(p->killed)
     exit(-1);
 
+  // check alarm i this is a timer interrupt.
+  if(which_dev == 2 && p->alarmenabled && p->alarmintvl){
+    acquire(&tickslock);
+    uint64 xticks = ticks;
+    release(&tickslock);
+    if (xticks - p->alarmprev >= p->alarmintvl) {
+      p->alarmenabled = 0;
+      memmove(&p->alarmstate.epc, &p->trapframe->epc, sizeof(p->alarmstate) - 24);
+      p->trapframe->epc = (uint64)p->alarmfn;
+    }
+  }
+
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
