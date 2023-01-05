@@ -5,11 +5,21 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
  */
 pagetable_t kernel_pagetable;
+
+struct pageref_struct {
+  struct spinlock lock;
+
+  // reference count of all physical pages.
+  // uint8 is enough since NPROC == 64
+  uint8 cnt[PHYSTOP/PGSIZE];
+} pageref;
 
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
@@ -21,6 +31,8 @@ extern char trampoline[]; // trampoline.S
 void
 kvminit()
 {
+  initlock(&pageref.lock, "pageref");
+
   kernel_pagetable = (pagetable_t) kalloc();
   memset(kernel_pagetable, 0, PGSIZE);
 
@@ -45,6 +57,8 @@ kvminit()
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  memset(pageref.cnt, 0, sizeof(pageref.cnt));
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -72,7 +86,7 @@ pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
   if(va >= MAXVA)
-    panic("walk");
+    return 0;
 
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
@@ -159,6 +173,9 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
     if(*pte & PTE_V)
       panic("remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
+    acquire(&pageref.lock);
+    pageref.cnt[pa/PGSIZE]++;
+    release(&pageref.lock);
     if(a == last)
       break;
     a += PGSIZE;
@@ -186,8 +203,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
+    uint64 pa = PTE2PA(*pte);
+    acquire(&pageref.lock);
+    uint8 pagerefcnt = --pageref.cnt[pa/PGSIZE];
+    release(&pageref.lock);
+    if(pagerefcnt == 0 && do_free){
       kfree((void*)pa);
     }
     *pte = 0;
@@ -240,6 +260,10 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
+    }
+    if(pageref.cnt[(uint64)mem/PGSIZE] != 0){
+      printf("pa=%p ref count=%d\n", (uint64)mem, pageref.cnt[(uint64)mem/PGSIZE]);
+      panic("uvmalloc: ref cnt wrong");
     }
     memset(mem, 0, PGSIZE);
     if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
@@ -311,7 +335,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,13 +343,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    if(flags & PTE_W) flags |= PTE_COW;
+    flags &= ~PTE_W;
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+  }
+  for(i = 0; i < sz; i += PGSIZE){
+    pte = walk(old, i, 0);
+    if(*pte & PTE_W) *pte |= PTE_COW;
+    *pte &= ~PTE_W;
   }
   return 0;
 
@@ -358,6 +384,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(copycowpage(pagetable, va0) != 0)
+      return -1;
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -439,4 +467,41 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// Copy a COW page if needed. 
+// If the page's ref count == 1, only modify the flags.
+// Return 0 on success or not a COW page, -1 on error.
+int
+copycowpage(pagetable_t pagetable, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_COW) == 0)
+    return 0;
+
+  uint64 pa = PTE2PA(*pte);
+  if(pageref.cnt[pa/PGSIZE] > 1){
+    uint64 flags = PTE_FLAGS(*pte);
+    char *mem = kalloc();
+    if(mem == 0)
+      return -1;
+    if(pageref.cnt[(uint64)mem/PGSIZE] != 0){
+      printf("pa=%p ref count=%d\n", (uint64)mem, pageref.cnt[(uint64)mem/PGSIZE]);
+      panic("copycowpage: ref cnt wrong");
+    }
+    memmove(mem, (char *)pa, PGSIZE);
+    uvmunmap(pagetable, va, 1, 1);
+    if(mappages(pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
+      kfree(mem);
+      return -1;
+    }
+    // pte = walk(pagetable, va, 0);
+  }
+
+  *pte &= ~PTE_COW;
+  *pte |= PTE_W;
+  return 0;
 }
